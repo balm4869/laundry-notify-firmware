@@ -1,0 +1,582 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <esp_task_wdt.h>
+#include <esp_sleep.h>
+
+// ============================================================================
+// 1. ตั้งค่า Wi-Fi และ ThingsBoard Cloud (ใส่ข้อมูลของคุณกลับเข้าไป 3 บรรทัดนี้)
+// ============================================================================
+const char* WIFI_SSID     = "Redmi Note 13 5G";
+const char* WIFI_PASSWORD = "876543210";
+const char* TB_SERVER     = "thingsboard.cloud"; // เปลี่ยนเป็น eu.thingsboard.cloud หากอยู่โซน EU
+const int   TB_PORT       = 1883;
+const char* TB_TOKEN      = "DDObke4f3SYNviMKgbm2";
+
+// ============================================================================
+// 2. กำหนดขา Pin ตาม Schematic & Rework Guide (ESP32-S3 N16R8)
+// ============================================================================
+#define I2C_SDA_PIN     16
+#define I2C_SCL_PIN     15
+#define MPU_INT_PIN     17
+
+#define BTN_PAGE_PIN    4   // ปุ่ม 1 (BTN3): ปลุกจอ / เปลี่ยนหน้าจอ OLED
+#define BTN_ACTION_PIN  5   // ปุ่ม 2 (BTN4): ปรับเวลาแช่ผ้า / เริ่มทำงาน / รีเซ็ตเมื่อเสร็จ
+#define BTN_RESET_PIN   6   // ปุ่ม 3 (BTN5): รีเซ็ตสถานะเป็น IDLE และส่งข้อมูลขึ้น Cloud ทันที
+
+#define SCREEN_WIDTH    128
+#define SCREEN_HEIGHT   64
+#define OLED_ADDR       0x3C
+
+// ============================================================================
+// 3. ค่าพารามิเตอร์ระบบ State Machine & Sleep Mode
+// ============================================================================
+const float VIB_THRESHOLD_WASH = 0.12f; // เกณฑ์แรงสั่นเริ่มซัก (m/s^2)
+const float VIB_THRESHOLD_SPIN = 1.20f; // เกณฑ์แรงสั่นปั่นหมาด (m/s^2)
+
+const unsigned long SCREEN_TIMEOUT_MS   = 15000;  // ดับจอ OLED อัตโนมัติหลังไม่กดปุ่ม 15 วินาที
+const unsigned long IDLE_DEEP_SLEEP_MS  = 180000; // ถ้าเครื่องนิ่ง (IDLE) เกิน 3 นาที ให้เข้า Deep Sleep
+const unsigned long DONE_HOLD_MS        = 30000;  // แสดงสถานะ DONE 30 วินาที แล้วเข้า Deep Sleep
+
+// ตัวเลือกเวลาหน่วงรอบแช่ผ้า (วินาที): 10 นาที, 15 นาที, 5 นาที, และ 1 นาที (สำหรับทดสอบ)
+const int SOAK_PRESETS[] = {600, 900, 300, 60};
+int soakPresetIndex = 0;
+
+// ============================================================================
+// 4. ตัวแปรสถานะและออบเจกต์หลัก
+// ============================================================================
+enum MachineState {
+  STATE_IDLE = 0,
+  STATE_WASHING = 1,
+  STATE_SOAK_WAIT = 2,
+  STATE_DONE = 3
+};
+
+struct SystemTelemetry {
+  MachineState state = STATE_IDLE;
+  String activityLabel = "IDLE";
+  float vibrationRms = 0.0f;
+  float aiConfidence = 0.0f;
+  int soakDurationSec = 600;
+  int soakRemainingSec = 0;
+  unsigned long washElapsedSec = 0;
+  bool wifiConnected = false;
+  bool tbConnected = false;
+  int rssi = 0;
+};
+
+SystemTelemetry sysData;
+SemaphoreHandle_t dataMutex;
+volatile bool forcePublishFlag = false;
+
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Adafruit_MPU6050 mpu;
+WiFiClient espClient;
+PubSubClient tbClient(espClient);
+
+unsigned long lastActivityTime = 0;
+unsigned long stateEnterTime = 0;
+unsigned long washStartTime = 0;
+unsigned long soakStartTime = 0;
+bool isDisplayOn = true;
+uint8_t currentPage = 0;
+
+// ============================================================================
+// 5. ฟังก์ชันจัดการปุ่มกด (Software Debounce)
+// ============================================================================
+struct Button {
+  uint8_t pin;
+  bool lastReading;
+  bool stableState;
+  unsigned long lastDebounceTime;
+};
+
+Button btnPage   = {BTN_PAGE_PIN, HIGH, HIGH, 0};
+Button btnAction = {BTN_ACTION_PIN, HIGH, HIGH, 0};
+Button btnReset  = {BTN_RESET_PIN, HIGH, HIGH, 0};
+
+bool checkButtonPressed(Button &btn) {
+  bool reading = digitalRead(btn.pin);
+  if (reading != btn.lastReading) {
+    btn.lastDebounceTime = millis();
+  }
+  btn.lastReading = reading;
+
+  if ((millis() - btn.lastDebounceTime) > 40) {
+    if (reading != btn.stableState) {
+      btn.stableState = reading;
+      if (btn.stableState == LOW) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// ============================================================================
+// 6. ส่วนประมวลผลแรงสั่นสะเทือน (จุดเชื่อมต่อ Edge Impulse ในอนาคต)
+// ============================================================================
+void classifyLaundryState(float rms, String &outLabel, float &outConfidence) {
+  if (rms >= VIB_THRESHOLD_SPIN) {
+    outLabel = "SPINNING";
+    outConfidence = min(99.0f, 75.0f + (rms - VIB_THRESHOLD_SPIN) * 10.0f);
+  } else if (rms >= VIB_THRESHOLD_WASH) {
+    outLabel = "WASHING";
+    outConfidence = min(98.0f, 70.0f + (rms - VIB_THRESHOLD_WASH) * 20.0f);
+  } else {
+    outLabel = "IDLE";
+    outConfidence = max(80.0f, 99.0f - (rms * 100.0f));
+  }
+}
+
+float sampleVibrationRMS() {
+  const int SAMPLES = 25;
+  float ax[SAMPLES], ay[SAMPLES], az[SAMPLES];
+  float meanX = 0, meanY = 0, meanZ = 0;
+
+  for (int i = 0; i < SAMPLES; i++) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    ax[i] = a.acceleration.x;
+    ay[i] = a.acceleration.y;
+    az[i] = a.acceleration.z;
+    meanX += ax[i];
+    meanY += ay[i];
+    meanZ += az[i];
+    delay(20);
+  }
+
+  meanX /= SAMPLES;
+  meanY /= SAMPLES;
+  meanZ /= SAMPLES;
+
+  float sumSq = 0;
+  for (int i = 0; i < SAMPLES; i++) {
+    float dx = ax[i] - meanX;
+    float dy = ay[i] - meanY;
+    float dz = az[i] - meanZ;
+    sumSq += (dx * dx + dy * dy + dz * dz);
+  }
+
+  return sqrt(sumSq / SAMPLES);
+}
+
+// ============================================================================
+// 7. โหมดประหยัดพลังงาน: ตั้งค่า MPU6050 Wake-on-Motion และเข้า Deep Sleep
+// ============================================================================
+void enterDeepSleepMode() {
+  Serial.println("[SLEEP] Preparing MPU6050 Motion Interrupt & Entering Deep Sleep...");
+
+  display.oled_command(SH110X_DISPLAYOFF);
+
+  mpu.setHighPassFilter(MPU6050_HIGHPASS_5_HZ);
+  mpu.setMotionDetectionThreshold(15);
+  mpu.setMotionDetectionDuration(2);
+  mpu.setInterruptPinPolarity(false);
+  mpu.setInterruptPinLatch(false);
+  mpu.setMotionInterrupt(true);
+
+  delay(100);
+
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN_PAGE_PIN, 0);
+  esp_sleep_enable_ext1_wakeup((1ULL << MPU_INT_PIN), ESP_EXT1_WAKEUP_ANY_HIGH);
+
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+// ============================================================================
+// 8. การจัดการ ThingsBoard (Core 0 Task)
+// ============================================================================
+const char* stateToString(MachineState st) {
+  switch (st) {
+    case STATE_IDLE:      return "IDLE";
+    case STATE_WASHING:   return "WASHING";
+    case STATE_SOAK_WAIT: return "SOAK_WAIT";
+    case STATE_DONE:      return "DONE";
+    default:              return "UNKNOWN";
+  }
+}
+
+void onThingsBoardMessage(char* topic, byte* payload, unsigned int length) {
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) return;
+
+  if (doc["soak_minutes"].is<int>()) {
+    int mins = doc["soak_minutes"];
+    if (mins >= 1 && mins <= 60) {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      sysData.soakDurationSec = mins * 60;
+      xSemaphoreGive(dataMutex);
+      forcePublishFlag = true;
+    }
+  }
+
+  if (doc["method"].is<const char*>()) {
+    String method = doc["method"].as<String>();
+    if (method == "reset") {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      sysData.state = STATE_IDLE;
+      sysData.soakRemainingSec = 0;
+      sysData.washElapsedSec = 0;
+      xSemaphoreGive(dataMutex);
+      stateEnterTime = millis();
+      forcePublishFlag = true;
+    }
+  }
+}
+
+void publishTelemetryToThingsBoard() {
+  if (!tbClient.connected()) return;
+
+  SystemTelemetry snap;
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  snap = sysData;
+  xSemaphoreGive(dataMutex);
+
+  JsonDocument doc;
+  doc["machine_state"]      = stateToString(snap.state);
+  doc["state_code"]         = (int)snap.state;
+  doc["ai_activity"]        = snap.activityLabel;
+  doc["ai_confidence"]      = round(snap.aiConfidence * 10) / 10.0;
+  doc["vibration_rms"]      = round(snap.vibrationRms * 1000) / 1000.0;
+  doc["soak_duration_sec"]  = snap.soakDurationSec;
+  doc["soak_remaining_sec"] = snap.soakRemainingSec;
+  doc["wash_elapsed_sec"]   = snap.washElapsedSec;
+  doc["wifi_rssi"]          = snap.rssi;
+
+  char buffer[384];
+  serializeJson(doc, buffer);
+  tbClient.publish("v1/devices/me/telemetry", buffer);
+}
+
+void networkTask(void* pvParameters) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  tbClient.setServer(TB_SERVER, TB_PORT);
+  tbClient.setCallback(onThingsBoardMessage);
+
+  unsigned long lastWifiAttempt = 0;
+  unsigned long lastTbAttempt = 0;
+  unsigned long lastPublishTime = 0;
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      sysData.wifiConnected = false;
+      sysData.tbConnected = false;
+      xSemaphoreGive(dataMutex);
+
+      if (millis() - lastWifiAttempt > 10000) {
+        lastWifiAttempt = millis();
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      }
+    } else {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      sysData.wifiConnected = true;
+      sysData.rssi = WiFi.RSSI();
+      xSemaphoreGive(dataMutex);
+
+      if (!tbClient.connected()) {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        sysData.tbConnected = false;
+        xSemaphoreGive(dataMutex);
+
+        if (millis() - lastTbAttempt > 5000) {
+          lastTbAttempt = millis();
+          if (tbClient.connect("Laundry_Node_01", TB_TOKEN, NULL)) {
+            tbClient.subscribe("v1/devices/me/rpc/request/+");
+            tbClient.subscribe("v1/devices/me/attributes");
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            sysData.tbConnected = true;
+            xSemaphoreGive(dataMutex);
+            forcePublishFlag = true;
+          }
+        }
+      } else {
+        tbClient.loop();
+
+        if (forcePublishFlag || (millis() - lastPublishTime >= 3000)) {
+          forcePublishFlag = false;
+          lastPublishTime = millis();
+          publishTelemetryToThingsBoard();
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// ============================================================================
+// 9. การแสดงผลหน้าจอ OLED SH1106 (3 หน้า)
+// ============================================================================
+void renderOLED() {
+  if (!isDisplayOn) return;
+
+  SystemTelemetry snap;
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  snap = sysData;
+  xSemaphoreGive(dataMutex);
+
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+
+  // แถบสถานะด้านบนสุด (Header)
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print(snap.wifiConnected ? "WiFi:OK " : "WiFi:-- ");
+  display.print(snap.tbConnected ? "TB:OK" : "TB:--");
+  display.setCursor(104, 0);
+  display.printf("P%d/3", currentPage + 1);
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+
+  if (currentPage == 0) {
+    display.setCursor(0, 15);
+    display.print("STATUS:");
+
+    display.setTextSize(2);
+    display.setCursor(0, 26);
+    display.print(stateToString(snap.state));
+
+    display.setTextSize(1);
+    display.setCursor(0, 48);
+    if (snap.state == STATE_SOAK_WAIT) {
+      int m = snap.soakRemainingSec / 60;
+      int s = snap.soakRemainingSec % 60;
+      display.printf("Soak Wait: %02d:%02d", m, s);
+    } else if (snap.state == STATE_WASHING) {
+      int m = snap.washElapsedSec / 60;
+      int s = snap.washElapsedSec % 60;
+      display.printf("Elapsed: %02d:%02d", m, s);
+    } else if (snap.state == STATE_DONE) {
+      display.print("Laundry Finished!");
+    } else {
+      display.print("Ready / Monitoring");
+    }
+  } 
+  else if (currentPage == 1) {
+    display.setTextSize(1);
+    display.setCursor(0, 15);
+    display.printf("Vib RMS : %.3f m/s2", snap.vibrationRms);
+    display.setCursor(0, 27);
+    display.printf("Pattern : %s", snap.activityLabel.c_str());
+    display.setCursor(0, 39);
+    display.printf("AI Conf : %.1f %%", snap.aiConfidence);
+    display.setCursor(0, 51);
+    display.printf("Soak Set: %d min", snap.soakDurationSec / 60);
+  } 
+  else if (currentPage == 2) {
+    display.setTextSize(1);
+    display.setCursor(0, 15);
+    display.printf("Soak Time: %d min", snap.soakDurationSec / 60);
+    display.setCursor(0, 28);
+    display.print("[Btn2] Change Soak");
+    display.setCursor(0, 40);
+    display.print("[Btn3] Reset / Sync");
+    display.setCursor(0, 52);
+    display.printf("RSSI: %d dBm", snap.rssi);
+  }
+
+  display.display();
+}
+
+// ============================================================================
+// 10. Setup & Main Loop (Core 1)
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  Serial.printf("\n[BOOT] Laundry Notify Starting... Wakeup cause: %d\n", wakeup_reason);
+
+  pinMode(BTN_PAGE_PIN, INPUT_PULLUP);
+  pinMode(BTN_ACTION_PIN, INPUT_PULLUP);
+  pinMode(BTN_RESET_PIN, INPUT_PULLUP);
+  pinMode(MPU_INT_PIN, INPUT);
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);
+
+  // เริ่มต้นจอ OLED SH1106 และหมุนจอ 180 องศาให้ตรงกับแนวบอร์ด
+  if (!display.begin(OLED_ADDR, true)) {
+    Serial.println("[ERR] SH1106 OLED not found!");
+  } else {
+    display.setRotation(2);
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SH110X_WHITE);
+    display.setCursor(10, 25);
+    display.println("LAUNDRY NOTIFY");
+    display.setCursor(10, 38);
+    display.println("Initializing...");
+    display.display();
+  }
+
+  if (!mpu.begin()) {
+    Serial.println("[ERR] MPU6050 not found! Check wiring.");
+  } else {
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    mpu.setMotionInterrupt(false);
+    Serial.println("[OK] MPU6050 Ready.");
+  }
+
+  dataMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(networkTask, "NetworkTask", 8192, NULL, 1, NULL, 0);
+
+  #if ESP_IDF_VERSION_MAJOR >= 5
+    esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = 15000,
+      .idle_core_mask = 0,
+      .trigger_panic = true
+    };
+    esp_task_wdt_init(&wdt_config);
+  #else
+    esp_task_wdt_init(15, true);
+  #endif
+  esp_task_wdt_add(NULL);
+
+  lastActivityTime = millis();
+  stateEnterTime = millis();
+}
+
+void loop() {
+  esp_task_wdt_reset();
+
+  bool p1 = checkButtonPressed(btnPage);
+  bool p2 = checkButtonPressed(btnAction);
+  bool p3 = checkButtonPressed(btnReset);
+
+  if (p1 || p2 || p3) {
+    lastActivityTime = millis();
+    if (!isDisplayOn) {
+      isDisplayOn = true;
+      display.oled_command(SH110X_DISPLAYON);
+      renderOLED();
+      return;
+    }
+
+    if (p1) {
+      currentPage = (currentPage + 1) % 3;
+    }
+
+    if (p2) {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      if (currentPage == 2) {
+        soakPresetIndex = (soakPresetIndex + 1) % 4;
+        sysData.soakDurationSec = SOAK_PRESETS[soakPresetIndex];
+      } else if (sysData.state == STATE_DONE) {
+        sysData.state = STATE_IDLE;
+        stateEnterTime = millis();
+      } else if (sysData.state == STATE_IDLE) {
+        sysData.state = STATE_WASHING;
+        washStartTime = millis();
+        stateEnterTime = millis();
+      }
+      xSemaphoreGive(dataMutex);
+      forcePublishFlag = true;
+    }
+
+    if (p3) {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      sysData.state = STATE_IDLE;
+      sysData.soakRemainingSec = 0;
+      sysData.washElapsedSec = 0;
+      xSemaphoreGive(dataMutex);
+      stateEnterTime = millis();
+      forcePublishFlag = true;
+    }
+  }
+
+  float rms = sampleVibrationRMS();
+  String actLabel;
+  float conf;
+  classifyLaundryState(rms, actLabel, conf);
+
+  bool isVibrating = (actLabel != "IDLE");
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  sysData.vibrationRms = rms;
+  sysData.activityLabel = actLabel;
+  sysData.aiConfidence = conf;
+
+  MachineState prevState = sysData.state;
+
+  switch (sysData.state) {
+    case STATE_IDLE:
+      if (isVibrating) {
+        sysData.state = STATE_WASHING;
+        washStartTime = millis();
+        stateEnterTime = millis();
+      }
+      break;
+
+    case STATE_WASHING:
+      sysData.washElapsedSec = (millis() - washStartTime) / 1000;
+      if (!isVibrating) {
+        sysData.state = STATE_SOAK_WAIT;
+        soakStartTime = millis();
+        stateEnterTime = millis();
+      }
+      break;
+
+    case STATE_SOAK_WAIT: {
+      sysData.washElapsedSec = (millis() - washStartTime) / 1000;
+      int elapsedSoak = (millis() - soakStartTime) / 1000;
+      sysData.soakRemainingSec = max(0, sysData.soakDurationSec - elapsedSoak);
+
+      if (isVibrating) {
+        sysData.state = STATE_WASHING;
+        sysData.soakRemainingSec = 0;
+        stateEnterTime = millis();
+      } else if (elapsedSoak >= sysData.soakDurationSec) {
+        sysData.state = STATE_DONE;
+        sysData.soakRemainingSec = 0;
+        stateEnterTime = millis();
+      }
+      break;
+    }
+
+    case STATE_DONE:
+      break;
+  }
+
+  MachineState currState = sysData.state;
+  xSemaphoreGive(dataMutex);
+
+  if (currState != prevState) {
+    lastActivityTime = millis();
+    if (!isDisplayOn) {
+      isDisplayOn = true;
+      display.oled_command(SH110X_DISPLAYON);
+    }
+    forcePublishFlag = true;
+  }
+
+  renderOLED();
+
+  if (isDisplayOn && (millis() - lastActivityTime > SCREEN_TIMEOUT_MS)) {
+    isDisplayOn = false;
+    display.oled_command(SH110X_DISPLAYOFF);
+  }
+
+  if (currState == STATE_DONE && (millis() - stateEnterTime > DONE_HOLD_MS)) {
+    publishTelemetryToThingsBoard();
+    delay(1000);
+    enterDeepSleepMode();
+  } 
+  else if (currState == STATE_IDLE && (millis() - stateEnterTime > IDLE_DEEP_SLEEP_MS)) {
+    enterDeepSleepMode();
+  }
+}

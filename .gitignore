@@ -1,0 +1,13 @@
+# PlatformIO build artifacts & local caches
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Local credentials (NEVER commit real tokens/passwords)
+include/secrets.h
+
+# Editor & OS files
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
